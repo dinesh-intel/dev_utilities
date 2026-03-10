@@ -1,17 +1,28 @@
-#Requires -Version 5.1
+#Requires -Version 5
 <#
 .SYNOPSIS
-    DevMachine-Setup.ps1 v2 - Automated development environment setup
+        DevMachine-Setup.ps1 v6.0 - Automated development environment setup
 .DESCRIPTION
-    Installs: VS Code, Miniforge (conda), Git, GitHub CLI
+        Installs: VS Code, Miniforge (conda), Git, GitHub CLI, Intel dt
     Configures: VS Code proxy settings, VS Code extensions
-    Creates: Python 3.11 environment called 'py_learn' with common packages for data + Excel/Word/PPT/PDF/image workflows
-    Installs: common Python packages including pymupdf for PDF processing
+        Creates: Python 3.11 environment called 'py_learn' with common packages for data + Excel/Word/PPT/PDF/image workflows (fully automated)
+        Installs: common Python packages including pymupdf for PDF processing using conda run
     Logs: detailed transcript to %TEMP%
-    
-    v2 changes: bug fixes (B-01..B-08), pre-flight checks, interactive mode,
-    per-package pip install, version detection, visual progress, dry-run support,
-    per-component skip flags, PS 5.1 compatibility.
+
+        Changelog:
+        - v6.0
+            * Added Intel dt bootstrap flow:
+                - Downloads dt.exe to Downloads folder
+                - Runs 'dt.exe install'
+                - Runs mandatory 'dt setup' after GitHub CLI setup
+            * Converted py_learn environment creation and package installation
+                from manual Miniforge Prompt instructions to automated conda commands
+                executed directly from PowerShell
+            * Updated startup banner and summary text for new tooling and automation
+        - v2
+            * Bug fixes (B-01..B-08), pre-flight checks, interactive mode,
+                per-package pip install, version detection, visual progress, dry-run support,
+                per-component skip flags, PS 5.1 compatibility.
 .PARAMETER Proxy
     Proxy server URL (default: http://proxy-chain.intel.com:912) - Used only for VS Code settings and manual instructions
 .PARAMETER NoProxy
@@ -42,6 +53,8 @@
     Skip VS Code extension installation
 .PARAMETER SkipGitHubAuth
     Skip GitHub CLI authentication
+.PARAMETER SkipDt
+    Skip Intel dt installation and setup
 .EXAMPLE
     .\DevMachine-Setup.ps1 -InstallIntelCerts
 .EXAMPLE
@@ -70,7 +83,8 @@ param(
     [switch]$SkipGitHubCLI,
     [switch]$SkipPythonPackages,
     [switch]$SkipExtensions,
-    [switch]$SkipGitHubAuth
+    [switch]$SkipGitHubAuth,
+    [switch]$SkipDt
 )
 
 Set-StrictMode -Version Latest
@@ -429,12 +443,19 @@ function Refresh-Path {
 # CONDA EXECUTABLE HELPER
 # ========================================
 function Get-CondaExecutable {
-    $miniforgeDir = Join-Path $env:USERPROFILE "miniforge3"
+    $miniforgeDirs = @(
+        (Join-Path $env:USERPROFILE "miniforge3"),
+        (Join-Path $env:LOCALAPPDATA "miniforge3")
+    )
     $condaPaths = @(
-        (Join-Path $miniforgeDir "condabin\conda.bat"),
-        (Join-Path $miniforgeDir "Scripts\conda.exe"),
-        (Join-Path $miniforgeDir "Scripts\conda.bat"),
-        (Join-Path $miniforgeDir "bin\conda")  # Linux/Mac style path as fallback
+        (Join-Path $miniforgeDirs[0] "condabin\conda.bat"),
+        (Join-Path $miniforgeDirs[0] "Scripts\conda.exe"),
+        (Join-Path $miniforgeDirs[0] "Scripts\conda.bat"),
+        (Join-Path $miniforgeDirs[0] "bin\conda"),
+        (Join-Path $miniforgeDirs[1] "condabin\conda.bat"),
+        (Join-Path $miniforgeDirs[1] "Scripts\conda.exe"),
+        (Join-Path $miniforgeDirs[1] "Scripts\conda.bat"),
+        (Join-Path $miniforgeDirs[1] "bin\conda")
     )
     
     foreach ($path in $condaPaths) {
@@ -448,6 +469,21 @@ function Get-CondaExecutable {
     foreach ($path in $condaPaths) {
         Write-Log "  Checked: $path" "WARN"
     }
+    return $null
+}
+
+function Resolve-CondaExecutable {
+    $condaPath = Get-CondaExecutable
+    if ($condaPath) {
+        return $condaPath
+    }
+
+    $cmd = Get-Command conda -ErrorAction SilentlyContinue
+    if ($cmd) {
+        Write-Log "Using conda from PATH: $($cmd.Source)" "SUCCESS"
+        return $cmd.Source
+    }
+
     return $null
 }
 
@@ -474,11 +510,40 @@ function Get-InstalledVersion {
                 return "not installed"
             }
             "python" { 
-                $v = & python --version 2>$null
-                if ($v -match "Python (\d+\.\d+\.\d+)") {
-                    return $matches[1]
+                $v = $null
+                if (Get-Command python -ErrorAction SilentlyContinue) {
+                    $v = & python --version 2>$null | Select-Object -First 1
+                    if ($v -match "Python (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
                 }
-                return $v
+
+                $condaPath = Resolve-CondaExecutable
+                if ($condaPath) {
+                    $v = & $condaPath run -n py_learn python --version 2>$null | Select-Object -First 1
+                    if ($v -match "Python (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+
+                    $v = & $condaPath run -n base python --version 2>$null | Select-Object -First 1
+                    if ($v -match "Python (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+                }
+
+                return "not installed"
+            }
+            "python-py_learn" {
+                $condaPath = Resolve-CondaExecutable
+                if (-not $condaPath) { return "not installed" }
+
+                $out = & $condaPath run -n py_learn python --version 2>&1
+                foreach ($line in $out) {
+                    if ($line -match "Python (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+                }
+                return "not installed"
             }
             "git"    { 
                 $v = & git --version 2>$null
@@ -495,11 +560,49 @@ function Get-InstalledVersion {
                 return $v
             }
             "pip"    { 
-                $v = & python -m pip --version 2>$null | Select-Object -First 1
-                if ($v -match "pip (\d+\.\d+\.\d+)") {
-                    return $matches[1]
+                $v = $null
+                if (Get-Command python -ErrorAction SilentlyContinue) {
+                    $v = & python -m pip --version 2>$null | Select-Object -First 1
+                    if ($v -match "pip (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
                 }
-                return $v
+
+                $condaPath = Resolve-CondaExecutable
+                if ($condaPath) {
+                    $v = & $condaPath run -n py_learn python -m pip --version 2>$null | Select-Object -First 1
+                    if ($v -match "pip (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+
+                    $v = & $condaPath run -n base python -m pip --version 2>$null | Select-Object -First 1
+                    if ($v -match "pip (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+                }
+
+                return "not installed"
+            }
+            "pip-py_learn" {
+                $condaPath = Resolve-CondaExecutable
+                if (-not $condaPath) { return "not installed" }
+
+                $out = & $condaPath run -n py_learn python -m pip --version 2>&1
+                foreach ($line in $out) {
+                    if ($line -match "pip (\d+\.\d+\.\d+)") {
+                        return $matches[1]
+                    }
+                }
+                return "not installed"
+            }
+            "dt"     {
+                $dtExe = Get-DtExecutablePath
+                if (Test-Path $dtExe) {
+                    $v = Get-DtVersion -DtExecutable $dtExe
+                    if ($v) { return $v }
+                    return "installed"
+                }
+                return "not installed"
             }
             "winget" { 
                 $v = & winget --version 2>$null
@@ -535,12 +638,16 @@ function Test-MiniforgePath {
 
 function Get-MiniforgePythonVersion {
     try {
-        $miniforgeDir = Join-Path $env:USERPROFILE "miniforge3"
-        $pythonExe = Join-Path $miniforgeDir "python.exe"
-        if (Test-Path $pythonExe) {
-            $v = & $pythonExe --version 2>$null
-            if ($v -match "Python (\d+\.\d+\.\d+)") {
-                return $matches[1]
+        $pythonCandidates = @(
+            (Join-Path $env:USERPROFILE "miniforge3\python.exe"),
+            (Join-Path $env:LOCALAPPDATA "miniforge3\python.exe")
+        )
+        foreach ($pythonExe in $pythonCandidates) {
+            if (Test-Path $pythonExe) {
+                $v = & $pythonExe --version 2>$null
+                if ($v -match "Python (\d+\.\d+\.\d+)") {
+                    return $matches[1]
+                }
             }
         }
         return "not found"
@@ -551,6 +658,17 @@ function Get-MiniforgePythonVersion {
 function Test-CondaEnvironmentExists {
     param([string]$EnvName)
     try {
+        $condaPath = Resolve-CondaExecutable
+        if ($condaPath) {
+            $envList = & $condaPath env list 2>$null
+            foreach ($line in $envList) {
+                if ($line -match "^\s*$EnvName\s" -or $line -match "\\envs\\$EnvName\s*$") {
+                    Write-Log "Conda environment '$EnvName' found in conda env list" "SUCCESS"
+                    return $true
+                }
+            }
+        }
+
         # Check multiple possible locations for conda environments
         $possiblePaths = @(
             (Join-Path $env:USERPROFILE "miniforge3\envs\$EnvName"),           # User profile location
@@ -726,30 +844,23 @@ function Create-PythonEnvironment {
         return
     }
 
-    Write-Log "Python environment 'py_learn' needs to be created manually" "WARN"
-    Write-Banner "MANUAL STEP REQUIRED - Python Environment Setup"
-    
-    Write-Host "  Please follow these steps to create the Python environment:" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  1. Open 'Miniforge Prompt' from Start Menu" -ForegroundColor Cyan
-    Write-Host "  2. Set proxy variables (if needed):" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     set http_proxy=$Proxy" -ForegroundColor White
-    Write-Host "     set https_proxy=$Proxy" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  3. Create the Python environment:" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     conda create -n py_learn python=3.11 -y" -ForegroundColor White
-    Write-Host "     conda activate py_learn" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  4. Press Enter here when completed..." -ForegroundColor Yellow
-    Read-Host "  "
-    
-    # Verify the environment was created
+    $condaPath = Resolve-CondaExecutable
+    if (-not $condaPath) {
+        throw "Conda executable not found. Install Miniforge first."
+    }
+
+    Write-Log "Creating Python environment 'py_learn' automatically via conda..."
+    $env:http_proxy = $Proxy
+    $env:https_proxy = $Proxy
+    & $condaPath create -n py_learn python=3.11 -y 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to create conda environment 'py_learn'"
+    }
+
     if (Test-CondaEnvironmentExists -EnvName "py_learn") {
         Write-Log "Python environment 'py_learn' created successfully" "SUCCESS"
     } else {
-        Write-Log "Could not verify py_learn environment creation. Please ensure it was created properly." "WARN"
+        throw "Could not verify py_learn environment creation"
     }
 }
 
@@ -760,74 +871,179 @@ function Install-PythonPackages {
         throw "py_learn environment not available"
     }
 
-    Write-Log "Python packages need to be installed manually in Miniforge Prompt" "WARN"
-    Write-Banner "MANUAL STEP REQUIRED - Python Package Installation"
-    
-    Write-Host "  Please follow these steps to install Python packages:" -ForegroundColor Yellow
-    Write-Host ""
-    Write-Host "  1. Open 'Miniforge Prompt' from Start Menu" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  2. Set proxy variables (if needed):" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     set http_proxy=$Proxy" -ForegroundColor White
-    Write-Host "     set https_proxy=$Proxy" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  3. Activate the py_learn environment:" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     conda activate py_learn" -ForegroundColor White
-    Write-Host ""
-    Write-Host "  4. Copy and paste these commands one by one:" -ForegroundColor Cyan
-    Write-Host ""
-    
-    # Package groups with organized installation commands
-    Write-Host "     REM Upgrade pip and essential tools first" -ForegroundColor Green
-    Write-Host "     python -m pip install --upgrade pip setuptools wheel" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Data Science and Scientific Computing" -ForegroundColor Green
-    Write-Host "     python -m pip install numpy pandas scipy matplotlib seaborn scikit-learn" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Jupyter Notebooks" -ForegroundColor Green
-    Write-Host "     python -m pip install jupyter ipykernel" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Excel File Processing" -ForegroundColor Green
-    Write-Host "     python -m pip install openpyxl xlrd xlsxwriter" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Word and PowerPoint Processing" -ForegroundColor Green
-    Write-Host "     python -m pip install python-docx python-pptx" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM PDF Processing and Reporting" -ForegroundColor Green
-    Write-Host "     python -m pip install pypdf reportlab pymupdf" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Image Processing" -ForegroundColor Green
-    Write-Host "     python -m pip install pillow" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "     REM Utilities and Progress Bars" -ForegroundColor Green
-    Write-Host "     python -m pip install requests tqdm rich" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "  5. Test the installation:" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     python -c `"import pandas, numpy, pymupdf; print('All core packages working!')`"" -ForegroundColor White
-    Write-Host "     python -c `"import jupyter, openpyxl, requests; print('All utility packages working!')`"" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "  6. Optional - Install Jupyter kernel for VS Code:" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "     python -m ipykernel install --user --name py_learn --display-name `"Python (py_learn)`"" -ForegroundColor White
-    Write-Host ""
-    
-    Write-Host "  7. Press Enter here when all packages are installed..." -ForegroundColor Yellow
-    Read-Host "  "
-    
-    Write-Log "Python packages installation completed manually" "SUCCESS"
-    Write-Log "Note: Verify installation by running the test commands above" "WARN"
+    $condaPath = Resolve-CondaExecutable
+    if (-not $condaPath) {
+        throw "Conda executable not found. Install Miniforge first."
+    }
+
+    Write-Log "Installing Python packages automatically in py_learn using conda run..."
+    $env:http_proxy = $Proxy
+    $env:https_proxy = $Proxy
+
+    $installCommands = @(
+        @("python", "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"),
+        @("python", "-m", "pip", "install", "numpy", "pandas", "scipy", "matplotlib", "seaborn", "scikit-learn"),
+        @("python", "-m", "pip", "install", "jupyter", "ipykernel"),
+        @("python", "-m", "pip", "install", "openpyxl", "xlrd", "xlsxwriter"),
+        @("python", "-m", "pip", "install", "python-docx", "python-pptx"),
+        @("python", "-m", "pip", "install", "pypdf", "reportlab", "pymupdf"),
+        @("python", "-m", "pip", "install", "pillow"),
+        @("python", "-m", "pip", "install", "requests", "tqdm", "rich")
+    )
+
+    foreach ($cmdArgs in $installCommands) {
+        Write-Log ("  conda run -n py_learn " + ($cmdArgs -join " "))
+        & $condaPath run -n py_learn @cmdArgs 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Package install command failed: conda run -n py_learn $($cmdArgs -join ' ')"
+        }
+    }
+
+    # Validate that core imports work.
+    & $condaPath run -n py_learn python -c "import pandas,numpy,pymupdf,jupyter,openpyxl,requests; print('Package validation passed')" 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python package validation failed in py_learn"
+    }
+
+    Write-Log "Python packages installed and validated successfully" "SUCCESS"
+}
+
+# ========================================
+# DT INSTALLATION
+# ========================================
+function Get-DtExecutablePath {
+    return (Join-Path $env:USERPROFILE "Downloads\dt.exe")
+}
+
+function Get-DtVersion {
+    param([string]$DtExecutable)
+
+    $versionArgs = @(
+        @("version"),
+        @("-v")
+    )
+
+    foreach ($args in $versionArgs) {
+        try {
+            $out = & $DtExecutable @args 2>&1
+            if ($LASTEXITCODE -eq 0 -and $out) {
+                return ($out | Select-Object -First 1)
+            }
+        }
+        catch {
+            # Try the next supported variant.
+        }
+    }
+
+    try {
+        $helpOut = & $DtExecutable --help 2>&1
+        if ($LASTEXITCODE -eq 0 -or $helpOut) {
+            return "installed"
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Install-Dt {
+    $dtUrl = "https://gfx-assets.intel.com/artifactory/gfx-build-assets/build-tools/devtool-go/latest/artifacts/win64/dt.exe"
+    $dtExe = Get-DtExecutablePath
+    $downloadsDir = Split-Path -Parent $dtExe
+
+    New-Item -ItemType Directory -Path $downloadsDir -Force | Out-Null
+
+    Write-Log "Downloading Intel dt from: $dtUrl"
+    Invoke-WebRequest -Uri $dtUrl -OutFile $dtExe -UseBasicParsing
+
+    if (-not (Test-Path $dtExe)) {
+        throw "dt.exe download failed"
+    }
+
+    Write-Log "Running dt install from: $dtExe"
+    & $dtExe install 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "dt install failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Log "Intel dt installed successfully" "SUCCESS"
+}
+
+function Setup-Dt {
+    $dtExe = Get-DtExecutablePath
+    if (-not (Test-Path $dtExe)) {
+        throw "dt.exe not found at $dtExe"
+    }
+
+    Write-Log "Preparing environment for mandatory dt setup"
+    $env:http_proxy = $Proxy
+    $env:https_proxy = $Proxy
+
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        throw "GitHub CLI not found. dt setup requires GitHub authentication context."
+    }
+
+    try {
+        gh auth status 2>&1 | Out-Null
+    }
+    catch {
+        throw "GitHub CLI is not authenticated. Run 'gh auth login' and re-run the script for mandatory dt setup."
+    }
+
+    Write-Log "Running mandatory command: dt setup"
+    & $dtExe setup 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "dt setup failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Log "dt setup completed successfully" "SUCCESS"
+}
+
+function Verify-Setup {
+    if (-not $SkipPython) {
+        $condaPath = Resolve-CondaExecutable
+        if (-not $condaPath) {
+            throw "Conda executable not found for verification"
+        }
+
+        Write-Log "Verification 1/3: Checking Python version in py_learn"
+        $pyVersion = (& $condaPath run -n py_learn python --version 2>&1 | Select-Object -First 1)
+        $pyVersion | Out-Host
+        if (-not ($pyVersion -match "Python 3\.11\.")) {
+            throw "Expected Python 3.11.x in py_learn, got: $pyVersion"
+        }
+    }
+
+    if (-not $SkipPythonPackages) {
+        $condaPath = Resolve-CondaExecutable
+        if (-not $condaPath) {
+            throw "Conda executable not found for package verification"
+        }
+
+        Write-Log "Verification 2/3: Testing core Python package imports"
+        & $condaPath run -n py_learn python -c "import pandas,numpy,pymupdf; print('Success!')" 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Python package import verification failed"
+        }
+    }
+
+    if (-not $SkipDt) {
+        $dtExe = Get-DtExecutablePath
+        if (-not (Test-Path $dtExe)) {
+            throw "dt.exe not found for verification at $dtExe"
+        }
+
+        Write-Log "Verification 3/3: Checking dt availability"
+        $dtVersion = Get-DtVersion -DtExecutable $dtExe
+        if (-not $dtVersion) {
+            throw "Unable to verify dt installation from $dtExe"
+        }
+        Write-Log "  dt detected: $dtVersion"
+    }
+
+    Write-Log "All applicable verification checks completed successfully" "SUCCESS"
 }
 
 # ========================================
@@ -979,7 +1195,12 @@ function GitHub-Auth {
         Write-Host "  |  A browser / device-code flow will open.                |" -ForegroundColor Yellow
         Write-Host "  |  Complete it with your GitHub account to continue.      |" -ForegroundColor Yellow
         Write-Host "  +=========================================================+" -ForegroundColor Yellow
-        gh auth login 2>&1 | Out-Host
+
+        # Do not pipe interactive gh login output; piping can break TTY behavior.
+        & gh auth login
+        if ($LASTEXITCODE -ne 0) {
+            throw "gh auth login failed with exit code $LASTEXITCODE"
+        }
     }
 
     try {
@@ -1000,30 +1221,31 @@ function Show-VersionMatrix {
     $tools = @(
         @{ Name = "VS Code";    Cmd = "code"   },
         @{ Name = "Conda";      Cmd = "conda"  },
-        @{ Name = "Python";     Cmd = "python" },
+        @{ Name = "Python (py_learn)"; Cmd = "python-py_learn" },
         @{ Name = "Git";        Cmd = "git"    },
         @{ Name = "GitHub CLI"; Cmd = "gh"     },
-        @{ Name = "pip";        Cmd = "pip"    },
+        @{ Name = "pip (py_learn)"; Cmd = "pip-py_learn" },
+        @{ Name = "Intel dt";   Cmd = "dt"     },
         @{ Name = "WinGet";     Cmd = "winget" }
     )
 
-    Write-Host ("  {0,-14} {1}" -f "Tool", "Detected Version") -ForegroundColor Cyan
-    Write-Host ("  {0,-14} {1}" -f "----", "----------------") -ForegroundColor Cyan
+    Write-Host ("  {0,-18} {1}" -f "Tool", "Detected Version") -ForegroundColor Cyan
+    Write-Host ("  {0,-18} {1}" -f "----", "----------------") -ForegroundColor Cyan
 
     foreach ($t in $tools) {
         $ver = Get-InstalledVersion -Tool $t.Cmd
         if (-not $ver -or $ver -eq "not installed") {
-            Write-Host ("  {0,-14} {1}" -f $t.Name, "not installed") -ForegroundColor DarkGray
+            Write-Host ("  {0,-18} {1}" -f $t.Name, "not installed") -ForegroundColor DarkGray
         } else {
-            Write-Host ("  {0,-14} {1}" -f $t.Name, $ver) -ForegroundColor White
+            Write-Host ("  {0,-18} {1}" -f $t.Name, $ver) -ForegroundColor White
         }
     }
     
     # Show py_learn environment status
     if (Test-CondaEnvironmentExists -EnvName "py_learn") {
-        Write-Host ("  {0,-14} {1}" -f "py_learn env", "exists") -ForegroundColor Green
+        Write-Host ("  {0,-18} {1}" -f "py_learn env", "exists") -ForegroundColor Green
     } else {
-        Write-Host ("  {0,-14} {1}" -f "py_learn env", "not found") -ForegroundColor DarkGray
+        Write-Host ("  {0,-18} {1}" -f "py_learn env", "not found") -ForegroundColor DarkGray
     }
     
     Write-Host ""
@@ -1093,6 +1315,7 @@ function Show-Summary {
     Write-Host "    External PyPI    : $UseExternalPyPI"
     Write-Host "    Interactive      : $Interactive"
     Write-Host "    DryRun           : $DryRun"
+    Write-Host "    SkipDt           : $SkipDt"
     Write-Host ""
 
     # --- Log file path (repeated here per UF-06 / P1-08) ---
@@ -1105,49 +1328,33 @@ function Show-Summary {
     }
 
     if ($Success) {
-        Write-Banner "NEXT STEPS (Manual Actions Required)"
+        Write-Banner "NEXT STEPS"
         Write-Host ""
-        Write-Host "  IMPORTANT: Complete these steps in order:" -ForegroundColor Red
+        Write-Host "  Core verification (Python env, packages, dt) was completed automatically." -ForegroundColor Green
         Write-Host ""
-        Write-Host "  1. PROXY SETUP (if behind corporate firewall):" -ForegroundColor Yellow
-        Write-Host "     • Open 'Miniforge Prompt' from Start Menu" -ForegroundColor White
-        Write-Host "     • Set proxy variables:" -ForegroundColor White
-        Write-Host "       set http_proxy=$Proxy" -ForegroundColor DarkGray
-        Write-Host "       set https_proxy=$Proxy" -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host "  2. PYTHON ENVIRONMENT VERIFICATION:" -ForegroundColor Yellow
-        Write-Host "     • In Miniforge Prompt, run:" -ForegroundColor White
-        Write-Host "       conda activate py_learn" -ForegroundColor DarkGray
-        Write-Host "       python --version" -ForegroundColor DarkGray
-        Write-Host "     • Should show Python 3.11.x" -ForegroundColor White
-        Write-Host ""
-        Write-Host "  3. TEST PYTHON PACKAGES:" -ForegroundColor Yellow
-        Write-Host "     • In Miniforge Prompt with py_learn activated:" -ForegroundColor White
-        Write-Host "       python -c `"import pandas, numpy, pymupdf; print('Success!')`"" -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host "  4. GIT PROXY SETUP (if needed):" -ForegroundColor Yellow
+        Write-Host "  1. GIT PROXY SETUP (if needed):" -ForegroundColor Yellow
         Write-Host "     • In regular Command Prompt or PowerShell:" -ForegroundColor White
         Write-Host "       git config --global http.proxy $Proxy" -ForegroundColor DarkGray
         Write-Host "       git config --global https.proxy $Proxy" -ForegroundColor DarkGray
         Write-Host ""
-        Write-Host "  5. GITHUB COPILOT SETUP:" -ForegroundColor Yellow
+        Write-Host "  2. GITHUB COPILOT SETUP:" -ForegroundColor Yellow
         Write-Host "     • Ensure you have GitHub Copilot entitlement" -ForegroundColor White
         Write-Host "     • Complete required training and onboarding" -ForegroundColor White
         Write-Host ""
-        Write-Host "  6. START CODING:" -ForegroundColor Yellow
+        Write-Host "  3. START CODING:" -ForegroundColor Yellow
         Write-Host "     • Open VS Code: code ." -ForegroundColor White
         Write-Host "     • Sign in to GitHub when prompted by Copilot extensions" -ForegroundColor White
         Write-Host "     • Select py_learn as Python interpreter:" -ForegroundColor White
         Write-Host "       Ctrl+Shift+P > Python: Select Interpreter" -ForegroundColor DarkGray
         Write-Host "     • Verify Copilot status in VS Code status bar" -ForegroundColor White
         Write-Host ""
-        Write-Host "  7. QUICK TEST:" -ForegroundColor Yellow
+        Write-Host "  4. QUICK TEST:" -ForegroundColor Yellow
         Write-Host "     • Create a new .py file in VS Code" -ForegroundColor White
         Write-Host "     • Type: # Create a pandas dataframe" -ForegroundColor White
         Write-Host "     • Copilot should suggest code completion" -ForegroundColor White
         Write-Host ""
-        Write-Host "  8. PROXY COMMANDS REFERENCE:" -ForegroundColor Yellow
-        Write-Host "     • For Miniforge Prompt sessions:" -ForegroundColor White
+        Write-Host "  5. PROXY COMMANDS REFERENCE:" -ForegroundColor Yellow
+        Write-Host "     • For command sessions:" -ForegroundColor White
         Write-Host "       set http_proxy=$Proxy && set https_proxy=$Proxy" -ForegroundColor DarkGray
         Write-Host "     • For Git operations:" -ForegroundColor White
         Write-Host "       git config --global http.proxy $Proxy" -ForegroundColor DarkGray
@@ -1171,7 +1378,7 @@ function Show-Summary {
 # ========================================
 function Invoke-DevSetup {
     try {
-        Write-Banner "DevMachine Setup v2 -- VS Code + Copilot + Miniforge"
+        Write-Banner "DevMachine Setup v6.0 -- VS Code + Copilot + Miniforge + dt"
 
         Write-Log "Log File : $LogFile"
         Write-Log "Proxy    : $Proxy (for manual configuration only)"
@@ -1202,6 +1409,9 @@ function Invoke-DevSetup {
         $steps += "Configure VS Code proxy settings"
         if (-not $SkipExtensions)   { $steps += "Install VS Code extensions" }
         if (-not $SkipGitHubAuth)   { $steps += "Configure GitHub CLI authentication" }
+        if (-not $SkipDt)           { $steps += "Install Intel dt" }
+        if (-not $SkipDt)           { $steps += "Run mandatory dt setup" }
+        $steps += "Run automated verification checks"
 
         $script:TotalSteps = $steps.Count
 
@@ -1315,11 +1525,28 @@ function Invoke-DevSetup {
 
         # B-07 fix: GitHub auth uses MaxAttempts=1 (no retry for interactive flow)
         if (-not $SkipGitHubAuth) {
-            $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep "" -Optional -MaxAttempts 1 -ScriptBlock {
+            $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep (Get-NextStepName) -MaxAttempts 1 -ScriptBlock {
                 GitHub-Auth
             }
             $stepIdx++
         }
+
+        if (-not $SkipDt) {
+            $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep (Get-NextStepName) -ScriptBlock {
+                Install-Dt
+            }
+            $stepIdx++
+
+            $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep "" -MaxAttempts 1 -ScriptBlock {
+                Setup-Dt
+            }
+            $stepIdx++
+        }
+
+        $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep "" -ScriptBlock {
+            Verify-Setup
+        }
+        $stepIdx++
 
         Write-Log ""
         Show-Summary -Success $true
