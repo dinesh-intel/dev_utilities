@@ -1,9 +1,10 @@
 #Requires -Version 5
 <#
 .SYNOPSIS
-        DevMachine-Setup.ps1 v6.0 - Automated development environment setup
+        GHCP-Setup.ps1 v6.0 - Automated development environment setup
 .DESCRIPTION
-        Installs: VS Code, Miniforge (conda), Git, GitHub CLI, Intel dt
+        Installs: Miniforge (conda), Git, GitHub CLI, Intel dt
+    Note: VS Code must be installed manually from Company Portal
     Configures: VS Code proxy settings, VS Code extensions
         Creates: Python 3.11 environment called 'py_learn' with common packages for data + Excel/Word/PPT/PDF/image workflows (fully automated)
         Installs: common Python packages including pymupdf for PDF processing using conda run
@@ -56,13 +57,13 @@
 .PARAMETER SkipDt
     Skip Intel dt installation and setup
 .EXAMPLE
-    .\DevMachine-Setup.ps1 -InstallIntelCerts
+    .\GHCP-Setup.ps1 -InstallIntelCerts
 .EXAMPLE
-    .\DevMachine-Setup.ps1 -Interactive
+    .\GHCP-Setup.ps1 -Interactive
 .EXAMPLE
-    .\DevMachine-Setup.ps1 -DryRun
+    .\GHCP-Setup.ps1 -DryRun
 .EXAMPLE
-    .\DevMachine-Setup.ps1 -Proxy "http://proxy.iind.intel.com:911"
+    .\GHCP-Setup.ps1 -Proxy "http://proxy.iind.intel.com:911"
 #>
 
 [CmdletBinding()]
@@ -126,7 +127,7 @@ $script:VersionMatrix   = @()          # Post-run version table
 # LOGGING SETUP
 # ========================================
 $stamp   = Get-Date -Format "yyyyMMdd_HHmmss"
-$LogFile = Join-Path $env:TEMP "DevSetup_$stamp.log"
+$LogFile = Join-Path $env:TEMP "GHCPSetup_$stamp.log"
 # Stop any dangling transcript from a prior failed run, then start fresh
 try { Stop-Transcript -ErrorAction SilentlyContinue | Out-Null } catch { }
 try { Start-Transcript -Path $LogFile -Append -ErrorAction Stop | Out-Null }
@@ -183,7 +184,7 @@ function Write-StepBanner {
     Write-Host ""
 
     # PowerShell progress bar (visible in taskbar)
-    Write-Progress -Activity "DevMachine Setup" -Status "Step $Number / $Total : $Name" `
+    Write-Progress -Activity "GHCP Setup" -Status "Step $Number / $Total : $Name" `
         -PercentComplete $pct -Id 1
 }
 
@@ -799,6 +800,40 @@ function Install-Miniforge {
         return
     }
 
+    # --- License acceptance (required before downloading or installing) ---
+    Write-Host ""
+    Write-Host "  +=========================================================+" -ForegroundColor Yellow
+    Write-Host "  |  MINIFORGE LICENSE AGREEMENT                            |" -ForegroundColor Yellow
+    Write-Host "  |                                                         |" -ForegroundColor Yellow
+    Write-Host "  |  Miniforge is distributed under the BSD 3-Clause        |" -ForegroundColor White
+    Write-Host "  |  license. Packages installed from conda-forge use        |" -ForegroundColor White
+    Write-Host "  |  permissive open-source licenses (BSD, MIT, Apache 2.0).|" -ForegroundColor White
+    Write-Host "  |                                                         |" -ForegroundColor White
+    Write-Host "  |  Full license text:                                     |" -ForegroundColor White
+    Write-Host "  |  https://github.com/conda-forge/miniforge/blob/main/    |" -ForegroundColor Cyan
+    Write-Host "  |  LICENSE                                                |" -ForegroundColor Cyan
+    Write-Host "  |                                                         |" -ForegroundColor Yellow
+    Write-Host "  |  You MUST accept the license terms to continue.         |" -ForegroundColor Yellow
+    Write-Host "  +=========================================================+" -ForegroundColor Yellow
+    Write-Host ""
+
+    $licenseAccepted = $false
+    while (-not $licenseAccepted) {
+        $answer = Read-Host "  Accept Miniforge license terms? [Y]es / [N]o (abort)"
+        switch ($answer.Trim().ToUpper()) {
+            { $_ -eq "Y" -or $_ -eq "YES" } {
+                $licenseAccepted = $true
+            }
+            { $_ -eq "N" -or $_ -eq "NO" } {
+                throw "Miniforge license not accepted. Installation cannot proceed."
+            }
+            default {
+                Write-Host "  Invalid input. Please enter Y (yes) or N (no)." -ForegroundColor Red
+            }
+        }
+    }
+    Write-Log "Miniforge license accepted by user" "SUCCESS"
+
     Write-Log "Installing Miniforge (conda-forge distribution)..."
     
     $TempDir = Join-Path $env:TEMP "miniforge_install_$stamp"
@@ -963,42 +998,74 @@ function Install-Dt {
     }
 
     Write-Log "Running dt install from: $dtExe"
-    & $dtExe install 2>&1 | Out-Host
+    # Do NOT pipe output (no '2>&1 | Out-Host'). dt install may probe the console
+    # handle; piping it causes a Go nil-pointer panic (same root cause as dt setup).
+    & $dtExe install
     if ($LASTEXITCODE -ne 0) {
         throw "dt install failed with exit code $LASTEXITCODE"
     }
 
-    Write-Log "Intel dt installed successfully" "SUCCESS"
+    # Give the system a moment to finish writing the installed binary, then refresh PATH
+    # so that Setup-Dt can locate the real dt executable (not the bootstrapper).
+    Start-Sleep -Seconds 3
+    Refresh-Path
+
+    $dtCmd = Get-Command dt -ErrorAction SilentlyContinue
+    if ($dtCmd) {
+        Write-Log "Intel dt installed successfully. Binary in PATH: $($dtCmd.Source)" "SUCCESS"
+    } else {
+        Write-Log "dt install completed but 'dt' not yet visible in PATH. Setup-Dt will retry PATH refresh." "WARN"
+    }
 }
 
 function Setup-Dt {
-    $dtExe = Get-DtExecutablePath
-    if (-not (Test-Path $dtExe)) {
-        throw "dt.exe not found at $dtExe"
-    }
+    # 'dt install' adds %USERPROFILE%\bin to the system PATH but requires a brand-new
+    # terminal session to pick up that change — Refresh-Path cannot help here because
+    # Windows only propagates the updated PATH to new processes, not to the current one.
+    # Running 'dt setup' inside this session therefore hangs or panics.
+    # Solution: pause and ask the user to run 'dt setup' manually in a new Admin shell,
+    # then confirm here so the script can continue.
 
-    Write-Log "Preparing environment for mandatory dt setup"
-    $env:http_proxy = $Proxy
-    $env:https_proxy = $Proxy
+    Write-Host ""
+    Write-Host "  +============================================================+" -ForegroundColor Cyan
+    Write-Host "  |  ACTION REQUIRED: Run 'dt setup' in a new terminal         |" -ForegroundColor Cyan
+    Write-Host "  |                                                            |" -ForegroundColor Cyan
+    Write-Host "  |  'dt install' added dt to PATH, but the current PowerShell |" -ForegroundColor White
+    Write-Host "  |  session cannot see the updated PATH until a new shell is  |" -ForegroundColor White
+    Write-Host "  |  opened.  Please follow the steps below:                   |" -ForegroundColor White
+    Write-Host "  |                                                            |" -ForegroundColor Cyan
+    Write-Host "  |  1. Press Win + X  and choose                              |" -ForegroundColor Yellow
+    Write-Host "  |     'Windows PowerShell (Admin)'                           |" -ForegroundColor Yellow
+    Write-Host "  |     (or 'Terminal (Admin)' on Windows 11)                  |" -ForegroundColor Yellow
+    Write-Host "  |                                                            |" -ForegroundColor Cyan
+    Write-Host "  |  2. In the new Admin shell, run:                           |" -ForegroundColor Yellow
+    Write-Host "  |       dt setup                                             |" -ForegroundColor White
+    Write-Host "  |                                                            |" -ForegroundColor Cyan
+    Write-Host "  |  3. Complete the interactive prompts:                      |" -ForegroundColor Yellow
+    Write-Host "  |     - Allow devtool to manage github proxy settings -> Yes |" -ForegroundColor White
+    Write-Host "  |     - Enter your Intel email (e.g. name@intel.com)         |" -ForegroundColor White
+    Write-Host "  |     - Confirm your full name                               |" -ForegroundColor White
+    Write-Host "  |     - Skip token creation if you already have a valid token|" -ForegroundColor White
+    Write-Host "  |                                                            |" -ForegroundColor Cyan
+    Write-Host "  |  4. Once 'dt setup' finishes, return HERE and press Enter. |" -ForegroundColor Yellow
+    Write-Host "  +============================================================+" -ForegroundColor Cyan
+    Write-Host ""
 
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        throw "GitHub CLI not found. dt setup requires GitHub authentication context."
+    while ($true) {
+        $answer = Read-Host "  Has 'dt setup' completed successfully in the new shell? [Y]es / [N]o (abort)"
+        switch ($answer.Trim().ToUpper()) {
+            { $_ -eq "Y" -or $_ -eq "YES" } {
+                Write-Log "User confirmed dt setup completed successfully" "SUCCESS"
+                return
+            }
+            { $_ -eq "N" -or $_ -eq "NO" } {
+                throw "dt setup was not completed. Re-run this script after completing 'dt setup' in a new Admin shell."
+            }
+            default {
+                Write-Host "  Invalid input. Please enter Y (yes) or N (no)." -ForegroundColor Red
+            }
+        }
     }
-
-    try {
-        gh auth status 2>&1 | Out-Null
-    }
-    catch {
-        throw "GitHub CLI is not authenticated. Run 'gh auth login' and re-run the script for mandatory dt setup."
-    }
-
-    Write-Log "Running mandatory command: dt setup"
-    & $dtExe setup 2>&1 | Out-Host
-    if ($LASTEXITCODE -ne 0) {
-        throw "dt setup failed with exit code $LASTEXITCODE"
-    }
-
-    Write-Log "dt setup completed successfully" "SUCCESS"
 }
 
 function Verify-Setup {
@@ -1370,15 +1437,15 @@ function Show-Summary {
         Write-Host ""
     }
 
-    Write-Progress -Activity "DevMachine Setup" -Completed -Id 1
+    Write-Progress -Activity "GHCP Setup" -Completed -Id 1
 }
 
 # ========================================
 # MAIN EXECUTION
 # ========================================
-function Invoke-DevSetup {
+function Invoke-GHCPSetup {
     try {
-        Write-Banner "DevMachine Setup v6.0 -- VS Code + Copilot + Miniforge + dt"
+        Write-Banner "GHCP Setup v6.0 -- VS Code + Copilot + Miniforge + dt"
 
         Write-Log "Log File : $LogFile"
         Write-Log "Proxy    : $Proxy (for manual configuration only)"
@@ -1399,7 +1466,7 @@ function Invoke-DevSetup {
         $steps = @()
         $steps += "Ensure WinGet is available"
         if ($InstallIntelCerts) { $steps += "Install Intel certificate bundles" }
-        if (-not $SkipVSCode)       { $steps += "Install Visual Studio Code" }
+        if (-not $SkipVSCode)       { $steps += "VS Code Installation Instructions" }
         if (-not $SkipPython)       { $steps += "Install Miniforge" }
         if (-not $SkipPython)       { $steps += "Create Python 3.11 environment (py_learn)" }
         if (-not $SkipGit)          { $steps += "Install Git" }
@@ -1462,7 +1529,19 @@ function Invoke-DevSetup {
 
         if (-not $SkipVSCode) {
             $null = Invoke-WithRetry -StepName $steps[$stepIdx] -UpcomingStep (Get-NextStepName) -ScriptBlock {
-                Winget-Install -Id "Microsoft.VisualStudioCode"
+                Write-Host ""
+                Write-Host "  +=========================================================+" -ForegroundColor Yellow
+                Write-Host "  |  ACTION REQUIRED: Install VS Code from Company Portal   |" -ForegroundColor Yellow
+                Write-Host "  |                                                         |" -ForegroundColor Yellow
+                Write-Host "  |  1. Open 'Company Portal' on your machine.              |" -ForegroundColor White
+                Write-Host "  |  2. Search for 'Visual Studio Code'.                    |" -ForegroundColor White
+                Write-Host "  |  3. Click Install and wait for it to complete.          |" -ForegroundColor White
+                Write-Host "  |                                                         |" -ForegroundColor Yellow
+                Write-Host "  |  For issues, contact:                                   |" -ForegroundColor White
+                Write-Host "  |    B S Supritha  or  Dinesh Naik                        |" -ForegroundColor Cyan
+                Write-Host "  +=========================================================+" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Log "VS Code must be installed from Company Portal. See instructions above." "WARN"
             }
             $stepIdx++
         }
@@ -1566,4 +1645,4 @@ function Invoke-DevSetup {
 }
 
 # Execute main function
-Invoke-DevSetup
+Invoke-GHCPSetup
