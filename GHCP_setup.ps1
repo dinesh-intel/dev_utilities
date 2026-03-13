@@ -14,7 +14,7 @@
         - v6.0
             * Added Intel dt bootstrap flow:
                 - Downloads dt.exe to Downloads folder
-                - Runs 'dt.exe install'
+                - Runs 'dt.exe  install'
                 - Runs mandatory 'dt setup' after GitHub CLI setup
             * Converted py_learn environment creation and package installation
                 from manual Miniforge Prompt instructions to automated conda commands
